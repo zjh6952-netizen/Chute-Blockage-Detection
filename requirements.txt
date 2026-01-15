@@ -1,0 +1,38 @@
+# Python依赖包列表
+# 建议使用 Python 3.8 或更高版本
+
+# 深度学习框架
+torch>=2.0.0
+
+# 数据处理
+numpy>=1.24.0
+pandas>=1.5.0
+
+# 可视化
+matplotlib>=3.5.0
+
+# 科学计算
+scipy>=1.9.0
+
+# 音频处理
+pyaudio>=0.2.11
+
+#API调用
+fastapi
+uvicorn
+pydantic
+
+# 注意事项：
+# 1. Linux环境需要先安装PortAudio开发库:
+#    Ubuntu/Debian: sudo apt-get install portaudio19-dev
+#    CentOS/RHEL:   sudo yum install portaudio-devel
+#    MacOS:         brew install portaudio
+#
+# 2. 如果使用GPU，需要安装对应版本的CUDA和cuDNN
+#
+# 3. 安装命令:
+#    pip install -r requirements.txt
+#
+# 4. 如果在虚拟环境中安装失败，可以尝试:
+#    pip install --upgrade pip
+#    pip install -r requirements.txt --no-cache-dir

@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.log
+anomaly_samples/
+anomaly_metadata/
+checkpoints/
+venv/
+*.npy
