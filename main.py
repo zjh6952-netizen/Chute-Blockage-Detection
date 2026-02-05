@@ -1,6 +1,6 @@
 """
 曲线落煤管堵煤早期预警及自愈系统 - 主程序
-版本: v2.3 
+版本: v3.0
 """
 
 import time
@@ -8,15 +8,29 @@ import logging
 import signal
 import sys
 import os
+import glob
 import threading
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 
-import config_final as config
+# 根据配置选择是否启用对比学习
+try:
+    from contrastive.config_contrastive import ENABLE_CONTRASTIVE_LEARNING
+except ImportError:
+    ENABLE_CONTRASTIVE_LEARNING = False
+
+if ENABLE_CONTRASTIVE_LEARNING:
+    import contrastive.config_contrastive as config
+    from contrastive.detector_engine_contrastive import AnomalyDetector
+    _VERSION = "v3.0 (对比学习增强)"
+else:
+    import config_final as config
+    from detector_engine import AnomalyDetector
+    _VERSION = "v2.3"
+
 from audio_source import SensorSource
-from detector_engine import AnomalyDetector
 from state_machine import ChuteFSM
 from utils import Watchdog
 from patter_controller import PatterController
@@ -34,11 +48,12 @@ class SharedState:
         self.analyst = HealthAnalyst()
         self.current_rmse = 0.0
         self.start_time = datetime.now()
+        self.lock = threading.Lock()
 
 ss = SharedState()
 
 # --- FastAPI 定义 ---
-app = FastAPI(title="曲线溜槽健康监测系统 API", version="2.3")
+app = FastAPI(title="曲线溜槽健康监测系统 API", version=_VERSION)
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,10 +65,12 @@ app.add_middleware(
 @app.get("/status")
 async def get_status():
     """实时状态查询接口"""
-    fsm_status = ss.fsm.get_status() if ss.fsm else {}
+    with ss.lock:
+        fsm_status = ss.fsm.get_status() if ss.fsm else {}
+        rmse = ss.current_rmse
     return {
         "state": fsm_status.get('state', 'INIT'),
-        "rmse": round(ss.current_rmse, 6),
+        "rmse": round(rmse, 6),
         "thresh_a": round(fsm_status.get('thresh_a', 0), 4),
         "thresh_b": round(fsm_status.get('thresh_b', 0), 4),
         "retry_count": fsm_status.get('retry_count', 0),
@@ -95,6 +112,8 @@ async def health_check():
     """健康检查接口"""
     return {
         "status": "healthy",
+        "version": _VERSION,
+        "contrastive_learning": ENABLE_CONTRASTIVE_LEARNING,
         "components": {
             "source": ss.source is not None,
             "detector": ss.detector is not None,
@@ -103,6 +122,26 @@ async def health_check():
             "estop": ss.estop is not None
         }
     }
+
+@app.get("/checkpoints")
+async def list_checkpoints():
+    """列出所有模型检查点"""
+    ckpt_dir = config.MODEL_CHECKPOINT_DIR
+    if not os.path.isdir(ckpt_dir):
+        return {"checkpoints": []}
+    ckpt_files = sorted(
+        glob.glob(os.path.join(ckpt_dir, "model_*.pth")),
+        key=os.path.getmtime, reverse=True
+    )
+    result = []
+    for f in ckpt_files:
+        stat = os.stat(f)
+        result.append({
+            "filename": os.path.basename(f),
+            "size_mb": round(stat.st_size / 1024 / 1024, 2),
+            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat()
+        })
+    return {"checkpoints": result, "total": len(result)}
 
 # --- Web 服务启动函数 ---
 def run_api_server():
@@ -123,7 +162,7 @@ def main():
     )
     
     logging.info("="*60)
-    logging.info("曲线落煤管堵煤早期预警及自愈系统 v2.3")
+    logging.info(f"曲线落煤管堵煤早期预警及自愈系统 {_VERSION}")
     logging.info("="*60)
     logging.info("系统正在启动 (API + 监控主循环)...")
 
@@ -157,15 +196,52 @@ def main():
         ss.fsm = ChuteFSM(ss.detector, ss.patter, ss.estop)
         
         logging.info("所有模块初始化完成")
-        
+
+        # 尝试自动加载最新检查点
+        auto_load = getattr(config, 'AUTO_LOAD_CHECKPOINT', True)
+        ckpt_dir = config.MODEL_CHECKPOINT_DIR
+        latest = None
+        if auto_load and os.path.isdir(ckpt_dir):
+            ckpt_files = sorted(
+                glob.glob(os.path.join(ckpt_dir, "model_*.pth")),
+                key=os.path.getmtime
+            )
+            if ckpt_files:
+                latest = ckpt_files[-1]
+                logging.info(f"发现检查点，尝试加载: {os.path.basename(latest)}")
+                if hasattr(ss.detector, 'load_checkpoint'):
+                    if ss.detector.load_checkpoint(latest):
+                        logging.info("已从检查点恢复模型状态，将跳过冷启动校准")
+                    else:
+                        logging.warning("检查点加载失败，将执行冷启动校准")
+                        latest = None
+                else:
+                    # v2.3 detector 没有 load_checkpoint，手动加载
+                    try:
+                        import torch
+                        checkpoint = torch.load(latest, map_location=ss.detector.device, weights_only=True)
+                        with ss.detector.lock:
+                            ss.detector.model.load_state_dict(checkpoint['model_state_dict'])
+                            ss.detector.thresh_a = checkpoint['thresh_a']
+                            ss.detector.thresh_b = checkpoint['thresh_b']
+                            if 'rmse_history' in checkpoint:
+                                ss.detector.rmse_history.extend(checkpoint['rmse_history'])
+                        logging.info("已从检查点恢复模型状态，将跳过冷启动校准")
+                    except Exception as e:
+                        logging.warning(f"检查点加载失败: {e}，将执行冷启动校准")
+                        latest = None
+
     except Exception as e:
         logging.critical(f"硬件初始化失败: {e}", exc_info=True)
         sys.exit(1)
-    
-    # 5. 启动 API 服务线程
-    api_thread = threading.Thread(target=run_api_server, daemon=True)
-    api_thread.start()
-    logging.info("API 服务已在后台启动 (Port: 8000)")
+
+    # 5. 启动 API 服务线程（可配置开关）
+    if config.ENABLE_REMOTE_MONITORING:
+        api_thread = threading.Thread(target=run_api_server, daemon=True)
+        api_thread.start()
+        logging.info("API 服务已在后台启动 (Port: 8000)")
+    else:
+        logging.info("API 服务已禁用（ENABLE_REMOTE_MONITORING = False）")
 
     # 6. 看门狗
     def on_watchdog_timeout():
@@ -205,21 +281,31 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # 8. 校准阶段
-    logging.info(f"开始冷启动校准 (需要 {config.INIT_CALIBRATION_SAMPLES} 个样本)...")
-    c_data = []
-    while len(c_data) < config.INIT_CALIBRATION_SAMPLES:
-        f = ss.source.get_fft_feature(is_calibrating=True)
-        if f is not None: 
-            c_data.append(f)
-            # 进度显示
-            progress = len(c_data) / config.INIT_CALIBRATION_SAMPLES * 100
-            print(f"\r校准进度: {len(c_data)}/{config.INIT_CALIBRATION_SAMPLES} ({progress:.0f}%)", end="", flush=True)
-    print()  # 换行
-    
-    ss.detector.calibrate(c_data, ss.source)
-    ss.detector.save_checkpoint()
-    logging.info("冷启动校准完成")
+    # 8. 校准阶段（如果已加载检查点则跳过）
+    if latest is not None and ss.detector.thresh_a > 0:
+        logging.info("已从检查点恢复，跳过冷启动校准")
+        # 仍需初始化音频能量基准
+        logging.info("采集少量样本初始化音频能量基准...")
+        scale_data = []
+        while len(scale_data) < 20:
+            f = ss.source.get_fft_feature(is_calibrating=True)
+            if f is not None:
+                scale_data.append(f)
+        ss.source.set_scale(scale_data)
+    else:
+        logging.info(f"开始冷启动校准 (需要 {config.INIT_CALIBRATION_SAMPLES} 个样本)...")
+        c_data = []
+        while len(c_data) < config.INIT_CALIBRATION_SAMPLES:
+            f = ss.source.get_fft_feature(is_calibrating=True)
+            if f is not None:
+                c_data.append(f)
+                progress = len(c_data) / config.INIT_CALIBRATION_SAMPLES * 100
+                print(f"\r校准进度: {len(c_data)}/{config.INIT_CALIBRATION_SAMPLES} ({progress:.0f}%)", end="", flush=True)
+        print()
+
+        ss.detector.calibrate(c_data, ss.source)
+        ss.detector.save_checkpoint()
+        logging.info("冷启动校准完成")
 
     # 9. 主循环
     logging.info("="*60)
@@ -243,13 +329,15 @@ def main():
                     
                     # 预测
                     rmse = ss.detector.predict(feat)
-                    ss.current_rmse = rmse
-                    
+
                     # 更新动态阈值
                     ss.detector.update_dynamic_thresholds(rmse, ss.fsm.state)
-                    
+
                     # 状态机步进
                     state = ss.fsm.step(rmse, feat)
+
+                    with ss.lock:
+                        ss.current_rmse = rmse
                     
                     # 喂狗
                     watchdog.feed()
