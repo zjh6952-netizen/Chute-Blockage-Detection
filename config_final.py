@@ -79,6 +79,8 @@ CALIBRATION_EPOCHS = 100
 THREAD_JOIN_TIMEOUT = 5.0
 MODEL_SAVE_INTERVAL = 1000
 MODEL_CHECKPOINT_DIR = "checkpoints"
+MODEL_CHECKPOINT_MAX_KEEP = 10   # 保留最近N个检查点（按时间排序）
+AUTO_LOAD_CHECKPOINT = True      # 启动时自动加载最新检查点
 ENABLE_WATCHDOG = True           # 启用看门狗
 WATCHDOG_TIMEOUT = 60            # 看门狗超时时间（秒）
 
